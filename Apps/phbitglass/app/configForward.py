@@ -1,5 +1,5 @@
 """
-(C) Copyright Bitglass Inc. 2020. All Rights Reserved.
+(C) Copyright Bitglass Inc. 2021. All Rights Reserved.
 Author: eng@bitglass.com
 """
 
@@ -7,15 +7,14 @@ import re
 
 from six import PY2
 
-from app.config import Config, Feature, Status, log
+import app
+from app.config import Config, Status
 from app.secret import Password
 
 try:
     from flask import session
-except Exception as ex:
+except ImportError:
     session = {}
-
-# NOTE Do not import from package app/
 
 
 sources = [
@@ -92,7 +91,7 @@ class ConfigForward(Config):
                       'log interval, seconds'),
         log_initial=('-i',
                      'log initial period, seconds'),
-        # - TODO proxies
+        # - TODO proxies, reset_time
         # - ?? method
     )
     )
@@ -104,7 +103,7 @@ class ConfigForward(Config):
             self.status[log_type] = Status()
 
         # Can't keep it here b/c of deepcopying
-        #self._condition = condition
+        # self._condition = condition
 
         # Load some (useful) hard-coded defaults
         source = 0
@@ -129,6 +128,11 @@ class ConfigForward(Config):
         self.log_initial = 30 * 24 * 3600
         self._max_request_rate = 10
 
+        # Last log reset
+        self._reset_time = ''   # It's reset automatically back to the default upon use. Never persist (the underscore in the name)!
+        self.hardreset = True   # Empty the contents of lastlog files just short of deleting the files (vs. resetting the 'time' field to preserve the other data for easy troubleshooting)
+        self.reset_fence = ''   # Used only by x_*.py modules' code where an alternative config store is used without the read-once-reset-to-default functionality like Splunk
+
         # Additional (optional) settings, not exposed in the UI for now
         self.method = None
         self.verify = True
@@ -142,7 +146,7 @@ class ConfigForward(Config):
             self.log_initial = 7 * 24 * 3600
 
         # Load secrets (if managing secure storage)
-        if not self._isEnabled('splunk'):
+        if not self._isEnabled('splunk') and not self._isEnabled('phantom'):
             self._auth_token.load()
             self._password.load()
 
@@ -217,10 +221,10 @@ class ConfigForward(Config):
 
                 proxy = {'schema': schema, 'schema_p': schema_p, 'user': user, 'pswd': pswd, 'host': host, 'port': port}
                 proxies.append(proxy)
+            except Exception as ex:
+                raise BaseException('Bad proxy expression %s' % str(ex))
             except BaseException as ex:
                 raise ex
-            except Exception as ex:
-                raise BaseException('Bad proxy expression')
         return proxies
 
     # From user multi-string to param dict
@@ -260,47 +264,54 @@ class ConfigForward(Config):
         else:
             logTypes = [lt for lt in self.log_types]
 
-        # for lt in [u'access', u'admin', u'cloud_audit']:
-        for lt in [u'access', u'admin', u'cloud_audit', u'swgweb', u'swgwebdlp']:
+        for lt in [u'access', u'admin', u'cloud_audit', u'swgweb', u'swgwebdlp', u'reset_time']:
             log_type = lt.replace('_', '')
             if len(rform.getlist(lt)):
-                if log_type not in logTypes:
-                    logTypes += [log_type]
+                if log_type == 'resettime':
+                    reset_time = 'reset'
+                else:
+                    if log_type not in logTypes:
+                        logTypes += [log_type]
             else:
-                if log_type in logTypes:
-                    logTypes.remove(log_type)
+                if log_type == 'resettime':
+                    reset_time = ''
+                else:
+                    if log_type in logTypes:
+                        logTypes.remove(log_type)
 
         logTypes.sort()
-        auth_type = True if len(rform.getlist('auth_type')) else False
-        use_proxy = True if len(rform.getlist('use_proxy')) else False
+        auth_type = len(rform.getlist('auth_type'))
+        use_proxy = len(rform.getlist('use_proxy'))
 
-        log(str('POST %s %s %s %s' % ('auth_token', ', '.join(logTypes), log_interval, api_url)), level='info')
+        app.logger.info(str('POST %s %s %s %s' % ('auth_token', ', '.join(logTypes), log_interval, api_url)))
 
         # Assume update is needed if first time
         isChanged = True
-        if (self.updateCount > 0
+        if (self.updateCount > 0 and
                 # Don't care b/c not saved anyways
                 # and self._auth_type == True if auth_type == 'on' or auth_type == 'True' else False
                 # and self._use_proxy == True if use_proxy == 'on' or use_proxy == 'True' else False
                 #
                 # Not saved but need to check authentication to update status
-                and self._auth_token.secret == auth_token
-                and self._username == username
-                and self._password.secret == password
+                self._auth_token.secret == auth_token and
+                self._username == username and
+                self._password.secret == password and
                 #
-                and self.log_types == logTypes
-                and self.log_interval == log_interval
-                and self.api_url == api_url
-                and self.proxies == proxies
-                and self.sink_url == sink_url):
+                self.log_types == logTypes and
+                self.log_interval == log_interval and
+                self.api_url == api_url and
+                self.proxies == proxies and
+                self.sink_url == sink_url and
+                self._reset_time == reset_time):
             # return False
             isChanged = False
 
         # Update the data under thread lock
         # Do it to signal the poll thread to refresh the logs, even if no settings changed
+        isSaved = False
         with self._lock(condition):
-            self._auth_type = True if auth_type == 'on' or auth_type == 'True' else False
-            self._use_proxy = True if (use_proxy == 'on' or use_proxy == 'True') and proxies is not None else False
+            self._auth_type = auth_type == 'on' or auth_type == 'True'
+            self._use_proxy = (use_proxy == 'on' or use_proxy == 'True') and proxies is not None
             self._auth_token.secret = auth_token
             self._username = username
             self._password.secret = password
@@ -309,17 +320,27 @@ class ConfigForward(Config):
             self.api_url = api_url
             self.proxies = proxies
             self.sink_url = sink_url
+            self._reset_time = reset_time
 
             self._calculateOptions()
 
+            # Since the polling thread might update some (rare) settings for certain integrations
+            # like reset_fence, do the save under the lock (otherwise it wouldn't be necessary)
+            if self._isForeignConfigStore() and isChanged:
+                # Actually, should never end up here since for those cases
+                # the saving is done by alternative client code to alternative config store
+                self._save()
+                isSaved = True
+
         if isChanged:
-            # Save across sessions
-            self._save()
+            # Save across sessions without blocking on I/O
+            if not isSaved:
+                self._save()
 
             # Wait for the update to come through but only if there were changes as a compromise.
             # If there are no changes the page info likely won't be up-to-date to avoid the wait,
             # refreshing multiple times would get the "latest" status eventually.
-            # The wait time is a context switch + up to 3 (number of log types) API requests
+            # The wait time is a context switch + up to 5 (number of log types) API requests
             # TODO JS: The status could be updated continuously in the background AJAX-style
             self._waitForStatus()
 

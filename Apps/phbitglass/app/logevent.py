@@ -1,9 +1,9 @@
 """
-(C) Copyright Bitglass Inc. 2020. All Rights Reserved.
+(C) Copyright Bitglass Inc. 2021. All Rights Reserved.
 Author: eng@bitglass.com
 """
 
-import sys
+# import sys
 import logging
 import logging.handlers
 import json
@@ -43,6 +43,7 @@ def pushLog(d, address, logTime=datetime.utcnow()):
     return msg
 
 
+"""
 def main():
     args = sys.argv[1:]
     host = 'localhost'
@@ -62,7 +63,7 @@ def main():
     '"ipaddress": "v.x.y.z", "url": "/accounts/server_logout/", "request": "", "activity": "Logout", "emailsenttime": "",'
     '"useragent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.122 Safari/537.36",'
     '"emailto": ""}'
-    print (testPayload)
+    print (testPayload)     # noqa
 
     pushLog(testPayload, (host, 514))
     pushLog(testPayload, (host, 514))
@@ -70,3 +71,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+"""

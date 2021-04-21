@@ -1,8 +1,9 @@
 """
-(C) Copyright Bitglass Inc. 2020. All Rights Reserved.
+(C) Copyright Bitglass Inc. 2021. All Rights Reserved.
 Author: eng@bitglass.com
 """
 
+import sys
 import json
 import time
 import os
@@ -12,15 +13,10 @@ from datetime import datetime
 import re
 import optparse
 from six import PY2, iteritems, string_types
+import logging
 
-
-# HACK Avoid dependency on package app/ so it's monkey-patched from there, for the sake of CLI script
-_log = None
-
-
-def log(msg, level='info'):
-    if _log is not None:
-        _log(msg, level)
+import app
+from app.env import UpdateLoggingPath, datapath
 
 
 # Need to load json properly
@@ -54,7 +50,7 @@ def to_dict(obj):
         # if PY2:
         # Can't use dict comprehension in 2.6 (the version on QRadar box as of 7.3)
         return dict([(key, to_dict(getattr(obj, key)))
-                        for key in dir(obj) if not key.startswith('_') and 'status' not in key])
+                    for key in dir(obj) if not key.startswith('_') and 'status' not in key])
         # else:
         #     return {key: to_dict(getattr(obj, key))
         #             for key in dir(obj) if not key.startswith('_') and 'status' not in key}
@@ -122,7 +118,7 @@ def open_atomic(filepath, mode, **kwargs):
 
 
 class Config(object):
-    _version = '1.0.9'
+    _version = '1.0.10'     # TODO SKIP TO 1.0.12 (because of Splunk submission failure don't use the 11)
     _api_version_min = '1.0.7'
     _api_version_max = '1.1.0'
     _default = None
@@ -130,6 +126,8 @@ class Config(object):
     _flags = dict(
         logging_level=('-l',
                        'loglevel field, defaults to WARNING, options are: CRITICAL, ERROR, WARNING, INFO, DEBUG'),
+        featureset=('-f',
+                    'featureset (SIEM/SOAR platform name), defaults to qradar, options are: debug, bitglass, qradar, splunk, phantom, demisto'),
     )
 
     def _genOptions(self):
@@ -156,7 +154,7 @@ class Config(object):
             # Unless need to parse the remaining arguments..
             opts, args = self._genOptions().parse_args()
             if len(args) > 0:
-                log('Ignored unknown options "%s"' % str(args), level='warn')
+                app.logger.warning('Ignored unknown options "%s"' % str(args))
         else:
             args = ''
 
@@ -181,13 +179,13 @@ class Config(object):
                 d = getattr(self._default, k)
             if p != v:
                 if p == d:
-                    log('Ignored override with implicit default of config param "%s" of:\n%s' %
-                        (k, str(getattr(self, k))), level='info')
+                    app.logger.info('Ignored override with implicit default of config param "%s" of:\n%s' %
+                                    (k, str(getattr(self, k))))
                 else:
-                    log('Overriding config param %s with:\n%s' % (k, str(p)), level='info')
+                    app.logger.info('Overriding config param %s with:\n%s' % (k, str(p)))
                     if v != d:
-                        log('\t- double override of config param "%s" of:\n%s' %
-                            (k, str(getattr(self, k))), level='info')
+                        app.logger.info('\t- double override of config param "%s" of:\n%s' %
+                                        (k, str(getattr(self, k))))
                     if s is None:
                         setattr(self, k, p)
                     else:
@@ -213,7 +211,7 @@ class Config(object):
                     # if 'config.json' in fname:
                     #     app.config[key] = value
         except Exception as ex:
-            log('Could not load last configuration %s across app sessions: %s' % (fname, ex), level='info')
+            app.logger.info('Could not load last configuration %s across app sessions: %s' % (fname, ex))
 
     def _deepcopy(self):
         session = self._session
@@ -224,11 +222,9 @@ class Config(object):
 
     def __init__(self, fname=None, session={}):
 
-        # Keep it here (rather than at class ini time) to support monkey patching
         try:
-            from app.env import datapath
             self._folder = datapath
-        except Exception as ex:
+        except ImportError:
             self._folder = '/store/'
 
         if fname is None:
@@ -287,6 +283,9 @@ class Config(object):
                     return True
         return False
 
+    def _isForeignConfigStore(self):
+        return not (self._isEnabled('qradar') or self._isEnabled('bitglass'))
+
     def _save(self):
         if self._fname is None:
             # Nothing to save (just config.json - read-only)
@@ -309,7 +308,7 @@ class Config(object):
                 with open_atomic(self._fname, 'w') as f:
                     json.dump(d, f, indent=2, sort_keys=True)
         except Exception as ex:
-            log('Could not save last configuration %s across app sessions: %s' % (self._fname, ex), level='warn')
+            app.logger.warning('Could not save last configuration %s across app sessions: %s' % (self._fname, ex))
 
     def _waitForStatus(self):
         while self.status['updateCount'] < self.updateCount:
@@ -325,9 +324,9 @@ class Config(object):
             # IP address exclusion
             # private & local networks
             # FIXED: Commented out to allow private and local
-                # r'(?!(?:10|127)(?:\.\d{1,3}){3})'
-                # r'(?!(?:169\.254|192\.168)(?:\.\d{1,3}){2})'
-                # r'(?!172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})'
+            #   r'(?!(?:10|127)(?:\.\d{1,3}){3})'
+            #   r'(?!(?:169\.254|192\.168)(?:\.\d{1,3}){2})'
+            #   r'(?!172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})'
             # IP address dotted notation octets
             # excludes loopback network 0.0.0.0
             # excludes reserved space >= 224.0.0.0
@@ -359,3 +358,65 @@ class Config(object):
 
 
 startConf = Config()
+
+
+def setPythonLoggingLevel(logger, conf=startConf):
+    """ Set/override python logging level from the config
+    """
+    numeric_level = getattr(logging, conf.logging_level.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError('Invalid log level: %s' % conf.logging_level)
+    logger.setLevel(numeric_level)
+    for hdlr in logger.handlers:
+        hdlr.setLevel(numeric_level)
+    # Should have it as warning so it's visible by default but.. don't want to overflow the log
+    # when it's run periodically as a command..
+    logger.info('~~~ LOGGING ENABLED AT LEVEL: %s ~~~' % conf.logging_level)
+    return numeric_level
+
+
+def setPythonLogging(logger=None, defaultlogfolder=startConf._folder):
+    """ Set python logging options for a script (vs. a Flask app)
+    """
+
+    filename = UpdateLoggingPath(defaultlogfolder)
+
+    # Grab the logger object
+    addStderr = False
+    if logger is None:
+        addStderr = True
+        logger = logging.getLogger('com.bitglass.lss')
+
+    # This enables werkzeug logging
+    # logging.basicConfig(filename=, level=)
+
+    # Set default logging level from config
+    numeric_level = setPythonLoggingLevel(logger)
+
+    # Show thread and full path with INFO and up
+    fmt = """%(asctime)s [%(filename)s:%(lineno)d] [%(levelname)s]\n\t%(message)s"""
+    if numeric_level <= logging.INFO:
+        fmt = """%(asctime)s,%(msecs)d [%(pathname)s:%(lineno)d] [%(thread)d] [%(levelname)s]\n\t%(message)s"""
+
+    # Log to bitglass.log file
+    fh = logging.FileHandler(filename=filename)
+    fh.setLevel(numeric_level)
+
+    formatter = logging.Formatter(
+        fmt,
+        '%Y-%m-%d %H:%M:%S'
+    )
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    if addStderr:
+        # Log to STDERROR as well since it's run as a cli script
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setLevel(numeric_level)
+
+        # Stderr may be loaded into SIEMs like Splunk etc. so careful changing the format
+        formatterStderr = formatter
+        sh.setFormatter(formatterStderr)
+        logger.addHandler(sh)
+
+    return logger

@@ -1,9 +1,8 @@
 """
-(C) Copyright Bitglass Inc. 2020. All Rights Reserved.
+(C) Copyright Bitglass Inc. 2021. All Rights Reserved.
 Author: eng@bitglass.com
 """
 
-import sys
 import os
 import json
 
@@ -28,127 +27,21 @@ import time
 import copy
 from threading import Thread, Condition
 from datetime import datetime, timedelta
-import logging
 # from threading import get_ident
 
 
-import app.env
-from app.config import byteify, open_atomic, startConf
-import app.configForward
-import app.logevent
+import app
+from app.env import UpdateDataPath, datapath, loggingpath
+from app.config import byteify, open_atomic, setPythonLoggingLevel, setPythonLogging
+from app.configForward import ConfigForward, log_types
+from app.logevent import pushLog
 
 
-logger = None
+from app.cli import main
+
+
 conf = None
 lastLogFile = None
-
-
-def setLoggingLevel(logger, conf=startConf):
-    """ Set/override the logging level from the config
-    """
-    numeric_level = getattr(logging, conf.logging_level.upper(), None)
-    if not isinstance(numeric_level, int):
-        raise ValueError('Invalid log level: %s' % conf.logging_level)
-    logger.setLevel(numeric_level)
-    for hdlr in logger.handlers:
-        hdlr.setLevel(numeric_level)
-    logger.info('~~~ LOGGING ENABLED AT LEVEL: %s ~~~' % conf.logging_level)
-    return numeric_level
-
-
-def setLogging(logger=None, defaultlogfolder=startConf._folder):
-    """ Set logging options for a script (vs. a Flask app)
-    """
-    app.env.UpdateLoggingPath(defaultlogfolder)
-    filename = app.env.loggingpath
-
-    # Grab the logger object
-    addStderr = False
-    if logger is None:
-        addStderr = True
-        logger = logging.getLogger('bitglass_' + __name__)
-
-    # This enables werkzeug logging
-    # logging.basicConfig(filename=, level=)
-
-    # Set default logging level from config
-    numeric_level = setLoggingLevel(logger)
-
-    # Log to bitglass.log file
-    fh = logging.FileHandler(filename=filename)
-    fh.setLevel(numeric_level)
-
-    # if 'debug' in startConf.logging_level.lower():
-    #     fh.setLevel(logging.DEBUG)
-    #     logging.basicConfig(filename=filename, level=logging.DEBUG)
-    # elif 'info' in startConf.logging_level.lower():
-    #     fh.setLevel(logging.INFO)
-    #     logging.basicConfig(filename=filename, level=logging.INFO)
-    # else:
-    #     fh.setLevel(logging.WARNING)
-    #     logging.basicConfig(filename=filename, level=logging.WARNING)
-
-    formatter = logging.Formatter(
-        # TODO Adjust format adding time, thread and [] around thread and level
-        """%(levelname)s in %(module)s [%(pathname)s:%(lineno)d]:\n%(message)s"""
-    )
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
-    if addStderr:
-        # Log to STDERROR as well since it's run as a cli script
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setLevel(numeric_level)
-
-        # The errors are loaded into SIEMs like Splunk etc. so careful changing the format
-        formatter = logging.Formatter(
-            '%(asctime)s,Level=%(levelname)s, ErrorMessage=%(message)s',
-            '%m/%d/%Y %H:%M:%S')
-        sh.setFormatter(formatter)
-        logger.addHandler(sh)
-
-    return logger
-
-
-# Not started as a script directly or from another module so it's a Flask app (either QRadar or not)
-# Use Flask logging facilities (plus qpylib.log optionally) when running as a Flask app.
-# This wraps the logging to have the standard pythonic logging interface to use everywhere.
-if __name__ != '__main__' and __name__ != 'app.bg':
-
-    from app import log, set_log_level
-
-    # TODO Remove and just use Flask app.logger when the QRadar concern is gone
-    # Wraps either QRadar or Flask logging, same interface as the standard logging so it can be easily switched
-    class Logger:
-        def debug(self, msg):
-            log(msg, level='debug')
-
-        def info(self, msg):
-            log(msg, level='info')
-
-        def warning(self, msg):
-            log(msg, level='warn')
-
-        def error(self, msg):
-            log(msg, level='error')
-
-        def nop(self, msg):
-            pass
-    logger = Logger()
-    if 'error' in startConf.logging_level.lower():
-        set_log_level('error')
-        logger.debug = logger.nop
-        logger.info = logger.nop
-        logger.warning = logger.nop
-    elif 'warn' in startConf.logging_level.lower():
-        set_log_level('warn')
-        logger.debug = logger.nop
-        logger.info = logger.nop
-    elif 'info' in startConf.logging_level.lower():
-        set_log_level('info')
-        logger.info = logger.nop
-    else:
-        pass
 
 
 def ingestLogEvent(ctx, d, address, logTime):
@@ -156,7 +49,7 @@ def ingestLogEvent(ctx, d, address, logTime):
         ctx.ctx.bgPushLogEvent(d, address, logTime)
 
     # TODO Prevent recursion sending to itself with syslog socket
-    return app.logevent.pushLog(d, address, logTime)
+    return pushLog(d, address, logTime)
 
 
 def flushLogEvents(ctx):
@@ -164,33 +57,31 @@ def flushLogEvents(ctx):
         ctx.ctx.bgFlushLogEvents()
 
 
-def Initialize(ctx, datapath=app.env.datapath, skipArgs=False, _logger=None, _conf=None):
-    global logger
+def Initialize(ctx, datapath=datapath, skipArgs=False, _logger=None, _conf=None):
     global conf
     global lastLogFile
 
     # Monkey patch env.datapath first with the value from the command line to read bg json configs
     updatepath = False
     if datapath:
-        updatepath = app.env.UpdateDataPath(datapath)
+        updatepath = UpdateDataPath(datapath)
 
-    if not logger:
-        if not _logger:
-            logger = setLogging(None, datapath)
-            logger.info('~~~ Running in CLI mode ~~~')
+    if not app.logger and not _logger:
+        app.logger = setPythonLogging(None, datapath)
+        app.logger.info('~~~ Running in CLI mode (Python logging set) ~~~')
 
     if not datapath:
         # Put in the same directory as the logging file (the latter would be well-defined, without uuids)
-        datapath = os.path.split(app.env.loggingpath)[0] + os.sep
-        updatepath = app.env.UpdateDataPath(datapath)
+        datapath = os.path.split(loggingpath)[0] + os.sep
+        updatepath = UpdateDataPath(datapath)
         if updatepath:
             conf = None
 
     if not conf or updatepath:
         if not _conf:
-            conf = app.configForward.ConfigForward()
+            conf = ConfigForward()
             # Be sure to update the logging level once the config is loaded
-            setLoggingLevel(logger, conf)
+            setPythonLoggingLevel(app.logger, conf)
 
             if not skipArgs or conf._isEnabled('debug'):
                 # Parse and apply command line options. Always process for a local dev run ('debug'), it's compatible
@@ -206,7 +97,7 @@ def Initialize(ctx, datapath=app.env.datapath, skipArgs=False, _logger=None, _co
     conf._calculateOptions()
 
     if not lastLogFile or updatepath:
-        cnf = _conf if _conf else conf
+        cnf = _conf or conf
 
         # For Splunk app upgrade, manually 'cp lastlog.json ../local/' before upgrading to ingest incrementally
         # This is because it was saved in default/ in the previous version 1.0.8 and default/ is yanked during upgrade
@@ -234,7 +125,7 @@ class SyslogUDPHandler(socketserver.BaseRequestHandler):
         except (IOError, SystemExit):
             raise
         except KeyboardInterrupt:
-            logger.info("Crtl+C Pressed. Shutting down.")
+            app.logger.info("Crtl+C Pressed. Shutting down.")
 
     def handle(self):
         # logger = self.kwargs['logger']
@@ -251,10 +142,10 @@ class SyslogUDPHandler(socketserver.BaseRequestHandler):
             logData = json.loads(u'{"response":{"data":[' + data[start:end] + u']}}')
 
             with conf._lock(condition, notify=False):
-                transferLogs(None, log_types=None, logData=logData, npt=None, **self.kwargs)
+                transferLogs(None, logTypes=None, logData=logData, npt=None, **self.kwargs)
 
         except Exception as ex:
-            logger.warning('{0}\n - Discarded bad event message in syslog stream:\n"{1}"\n- from sender {2}'.format(
+            app.logger.warning('{0}\n - Discarded bad event message in syslog stream:\n"{1}"\n- from sender {2}'.format(
                 str(ex),
                 data,
                 self.client_address[0])
@@ -264,6 +155,7 @@ class SyslogUDPHandler(socketserver.BaseRequestHandler):
 
 TIME_FORMAT_URL = '%Y-%m-%dT%H:%M:%SZ'
 TIME_FORMAT_LOG = '%d %b %Y %H:%M:%S'
+TIME_FORMAT_ISO = '%Y-%m-%dT%H:%M:%S.%fZ'
 
 
 def strptime(s):
@@ -291,23 +183,22 @@ class LastLog:
 
                 if self.shared is None:
                     # This is a shared (old) file. Convert to the new format if needed
-                    for lt in app.configForward.log_types:
-                        if self.get(logtype=lt):
-                            if isinstance(self.log[lt], str):
-                                self.log[lt] = json.loads(self.log[lt])
+                    for lt in log_types:
+                        if self.get(logtype=lt) and isinstance(self.log[lt], str):
+                            self.log[lt] = json.loads(self.log[lt])
         except Exception as ex:
-            logger.info('{0}\n - Last log file {1} not found'.format(str(ex), self.fname))
+            app.logger.info('{0}\n - Last log file {1} not found'.format(str(ex), self.fname))
             lastLog = {}
             if self.shared:
                 lastLog[logtype] = self.shared.log[logtype]
             else:
-                for lt in app.configForward.log_types:
+                for lt in log_types:
                     lastLog[lt] = {}
             self.log = lastLog
 
         # Create children one per log type unless sharing the same file for all
         if self.shared is None and logtype != 'share':
-            for lt in app.configForward.log_types:
+            for lt in log_types:
                 self.subLogs[lt] = LastLog(fname, self, lt)
 
     def dump(self):
@@ -315,7 +206,7 @@ class LastLog:
             with open_atomic(self.fname, 'w') as f:
                 json.dump(self.log, f, indent=4, sort_keys=True)
         except Exception as ex:
-            logger.error('Could not save last log event across app sessions: %s' % ex)
+            app.logger.error('Could not save last log event across app sessions: %s' % ex)
 
     def get(self, field=None, logtype=None):
         if logtype is None:
@@ -330,7 +221,10 @@ class LastLog:
             res = json.loads(ll) if isinstance(ll, str) else ll
             return res[field] if field in res else None
 
-        return True if logtype in self.log and self.log[logtype] != {} else False
+        return logtype in self.log and self.log[logtype] != {}
+
+    def getHistoricLogTypeList(self):
+        return [lt for lt in log_types if self.get(logtype=lt)]
 
     def update(self, ll, logtype=None):
         if logtype is None:
@@ -353,21 +247,61 @@ class LastLog:
                 if self.get('_errormessage', logtype):
                     del self.log[logtype]['_errormessage']
 
-        return json.dumps(self.log[logtype])
+        if logtype in self.log:
+            return json.dumps(self.log[logtype])
+        else:
+            return ''
 
-    def updateError(self, errormsg, logtype=None):
+    def updateError(self, conf, errormsg, resettime, logtype=None):
         if logtype is None:
             logtype = self.logtype
         else:
             if logtype in self.subLogs:
-                return self.subLogs[logtype].updateError(errormsg)
+                return self.subLogs[logtype].updateError(conf, errormsg, resettime)
 
         if not self.get(logtype=logtype):
             self.log[logtype] = {}
 
+        # Handle the corner case of never having a successful message ever yet so add the missing time
+        # field to make the recovery possible (the data reading code defaults to 'now' in such case to
+        # play it safe and avoid the possible data duplication but this leads to never getting
+        # good messages unless by fluke of hitting upon a very recent message). Assume the initial
+        # data period just the same as the reading code does when starting up.
+        # This provides for an alternative hack to reset the log type: edit the file and rename the 'time' field.
+        if not self.get('time', logtype) or resettime:
+            if self.get('time', logtype):
+                # Backup the original 'time' field if present by renaming it first
+                self.log[logtype]['_time'] = self.log[logtype]['time']
+            t = datetime.utcnow() + timedelta(seconds=-1 * conf.log_initial) if not resettime else resettime
+            self.log[logtype]['time'] = t.strftime(TIME_FORMAT_LOG)
+
         # Update with failure timestamp and message, keep last ingested success timestamp
         self.log[logtype]['_failedtime'] = datetime.utcnow().strftime(TIME_FORMAT_LOG)
         self.log[logtype]['_errormessage'] = str(errormsg)
+        self.dump()
+
+    def clobber(self, resettime=None, logtype=None):
+        # Clobbering the children with empty json {} is the simplest and most robust way to go.
+        # Actually deleting the file would not be enough as the old format file persist, so
+        # implementing it correctly would need atomically updating more than one file which would
+        # complicate the code immensely and for Splunk, even the use of temp files is a potential
+        # certification problem (although bogus one IMO)
+        if logtype is None:
+            logtype = self.logtype
+        else:
+            if logtype in self.subLogs:
+                return self.subLogs[logtype].clobber(resettime)
+
+        # Just write bare braces (without adding the log type) keeping it simpler
+        # self.log[logtype] = {}
+        self.log = {}
+
+        # The softer option of rolling back the time (provided by the UI already for flexibility)
+        # TODO Ignore for the simplicity sake until the UI provides the actual reset time
+        # if resettime:
+        #     self.log[logtype] = {}
+        #     self.log[logtype]['time'] = resettime.strftime(TIME_FORMAT_LOG)
+
         self.dump()
 
 
@@ -379,31 +313,31 @@ def getAPIToken(logData, conf, logType):
         token = logData['nextpagetoken']
         d = json.loads(base64.b64decode(token))
     except Exception as ex:
-        logger.warning('Invalid token returned: %s %s' % (token, ex))
+        app.logger.warning('Invalid token returned: %s %s' % (token, ex))
         return None
 
     # TODO Swap the condition for compatibility if the new logtypes introduced use the same fields as in swqweb*
     if logType != u'swgweb' and logType != u'swgwebdlp':
         # Older log types
         if 'log_id' not in d:
-            logger.warning('No "log_id" encoded in returned token: %s' % token)
+            app.logger.warning('No "log_id" encoded in returned token: %s' % token)
             return None
 
         if 'datetime' not in d:
-            logger.warning('No "datetime" encoded in returned token: %s' % token)
+            app.logger.warning('No "datetime" encoded in returned token: %s' % token)
             return None
     else:
         # Newer log types
         if 'start_time' not in d:
-            logger.warning('No "start_time" encoded in returned token: %s' % token)
+            app.logger.warning('No "start_time" encoded in returned token: %s' % token)
             return None
 
         if 'end_time' not in d:
-            logger.warning('No "end_time" encoded in returned token: %s' % token)
+            app.logger.warning('No "end_time" encoded in returned token: %s' % token)
             return None
 
         if 'page' not in d:
-            logger.warning('No "page" encoded in returned token: %s' % token)
+            app.logger.warning('No "page" encoded in returned token: %s' % token)
             return None
 
     return token
@@ -473,7 +407,7 @@ def restCall(_,
         import requests_oauth2
         haveOAuth2 = True
     except ImportError as ex:
-        logger.warning('{0}\n - Defaulting to the legacy urllib module'.format(str(ex)))
+        app.logger.warning('{0}\n - Defaulting to the legacy urllib module'.format(str(ex)))
         haveOAuth2 = False
 
     # Use requests by default if available
@@ -500,6 +434,7 @@ def restCall(_,
                 # Assume json
                 r = s.post(url + endpoint, headers=headers, verify=verify, json=dataParams)
             else:
+                # TODO Inject failures (including the initial failure) for testing: raise Exception('test')
                 r = s.get(url + endpoint + dataParams, headers=headers, verify=verify)
 
             r.raise_for_status()
@@ -523,7 +458,7 @@ def restCall(_,
             urllib.install_opener(opener)
 
         # TODO Security scan medium. Remove urllib fallback use when QRadar moves to Python 3
-        resp = urllib.urlopen(req)  # nosec: <explanation>No custom schemes allowed as the url is validated to be https</explanation>
+        resp = urllib.urlopen(req)  # nosec: <explanation>The url is validated to be https</explanation>
         respTxt = resp.read()
         d = json.loads(respTxt)
 
@@ -547,12 +482,30 @@ def RestCall(_, endpoint, dataParams):
 
 def drainLogEvents(ctx, dtime, conf, logType, logData=None, nextPageToken=None):
 
-    logTime = dtime
-
     status = conf.status[logType]
     r = None
 
     isSyslog = (logData is not None)
+
+    if conf._reset_time and not isSyslog:
+        # Must be validated by the app if it's the actual time datetime.datetime
+        # TODO Can switch to using format TIME_FORMAT_ISO for conf._reset_time here and in the UI
+        dtime = datetime.utcnow() + timedelta(seconds=-1 * conf.log_initial)
+        nextPageToken = None
+
+        # Override the last log data with the new 'time' field
+        if conf.hardreset:
+            # This should be the default.
+            # Clobber all the data in the file as the last resort! This is the important fool-proof method for
+            # ultimate UI control on the cloud if some bug is suspected to hold new messages etc.
+            app.logger.warning('Hard-reset initiated due to user request. The data will resume when new messages get available.')
+            lastLogFile.clobber(dtime, logtype=logType)
+        else:
+            # The soft reset mode is essential for testing by keeping the state around. It's used for auto-reset as well
+            app.logger.warning('Soft-reset initiated due to user request. The data will resume when new messages get available.')
+            lastLogFile.updateError(conf, 'Soft-reset initiated due to user request. Waiting for the new data becoming available starting from (see the \'time\' field below)', dtime, logType)
+
+    logTime = dtime
 
     try:
         i = 0
@@ -640,12 +593,12 @@ def drainLogEvents(ctx, dtime, conf, logType, logData=None, nextPageToken=None):
         msg = 'Polling: failed to fetch log event data "%s": %s' % (str(logType), ex)
         if SKIPPED_REQUEST_ERROR in msg:
             # No valid settings have been set yet so avoid polluting the log. IMO this is still useful for debugging
-            # logger.debug(msg)
+            # app.logger.debug(msg)
             pass
         else:
-            logger.error(msg)
+            app.logger.error(msg)
             r = ex
-            lastLogFile.updateError(r, logType)
+            lastLogFile.updateError(conf, r, None, logType)
 
         status.cntError = status.cntError + 1
         status.lastMsg = str(ex)
@@ -661,30 +614,43 @@ def drainLogEvents(ctx, dtime, conf, logType, logData=None, nextPageToken=None):
     return logTime
 
 
-def transferLogs(ctx, conf, condition, dtime, log_types=None, logData=None, npt=None):
+def transferLogs(ctx, conf, condition, dtime, logTypes=None, logData=None, npt=None):
     myConf = conf._deepcopy()
     condition.release()
 
-    if not log_types:
-        log_types = myConf.log_types
+    if not logTypes:
+        if myConf._reset_time:
+            # Pull all the log types that have ever been pulled unless the specific log type list was provided (like in Phantom).
+            # Merge with the currently specified ones
+            # logTypes = log_types   # All possibly supported log types
+            h = lastLogFile.getHistoricLogTypeList()
+            n = myConf.log_types
+            logTypes = h + list(set(n) - set(h))   # Whatever have been tried from the last reset plus currently requested
+        else:
+            logTypes = myConf.log_types    # Only currently requested
 
     logTime = {}
     if logData is None:
-        for log_type in log_types:
-            logTime[log_type] = drainLogEvents(ctx, dtime[log_type], myConf, log_type, logData,
-                                                  npt[log_type] if npt is not None else None)
+        for lt in logTypes:
+            logTime[lt] = drainLogEvents(ctx, dtime[lt], myConf, lt, logData,
+                                         npt[lt] if npt is not None else None)
     else:
         # syslog source
         # Make sure nextpagetoken is disabled
         myConf.useNextPageToken = False
-        log_type = logData['response']['data'][0]['logtype']
-        logTime[log_type] = drainLogEvents(None, dtime[log_type], myConf, log_type, logData=logData)
+        lt = logData['response']['data'][0]['logtype']
+        logTime[lt] = drainLogEvents(None, dtime[lt], myConf, lt, logData=logData)
 
     condition.acquire()
     myConf.status['updateCount'] = conf.updateCount
 
-    # Load the latest state for the UI
+    # Load the latest state for the UI and reset the read-once-reset-to-default config params
     conf.status = copy.deepcopy(myConf.status)
+    if conf._reset_time:
+        if conf._isForeignConfigStore():
+            conf.reset_fence = datetime.utcnow().isoformat()
+            conf._save()
+        conf._reset_time = ''
 
     # Increment by smallest delta to avoid repeating same entries
     # TODO Using microseconds=1 causes event duplication.. what is the minimum resolution to increment??
@@ -692,14 +658,14 @@ def transferLogs(ctx, conf, condition, dtime, log_types=None, logData=None, npt=
     if logData is None:
         if conf._isDaemon:
             condition.wait(myConf.log_interval)
-        for log_type in log_types:
-            dtime[log_type] = logTime[log_type] + timedelta(seconds=1)
+        for lt in logTypes:
+            dtime[lt] = logTime[lt] + timedelta(seconds=1)
     else:
         # syslog source
-        dtime[log_type] = logTime[log_type] + timedelta(seconds=1)
+        dtime[lt] = logTime[lt] + timedelta(seconds=1)
 
 
-def PollLogs(ctx, conf, log_types=None, condition=Condition()):
+def PollLogs(ctx, conf, logTypes=None, condition=Condition()):
     """
     Pump BG log events from BG API to QRadar
     """
@@ -709,55 +675,67 @@ def PollLogs(ctx, conf, log_types=None, condition=Condition()):
     pid = os.getpid()
     # tid = get_ident()
     tid = 0
-    logger.info('================================================================')
-    logger.info('Polling: start polling log events.. pid=%s, tid=%s' % (pid, tid))
-    logger.info('----------------------------------------------------------------')
+    app.logger.info('================================================================')
+    app.logger.info('Polling: start polling log events.. pid=%s, tid=%s' % (pid, tid))
+    app.logger.info('----------------------------------------------------------------')
 
     # Have to complicate things b/c the API doesn't support combining different log types
     dtime = {}
     npt = {}
     now = datetime.utcnow()
-    for log_type in app.configForward.log_types:
+    for lt in log_types:
         # = datetime.utcnow() + timedelta(days=-1)
-        dtime[log_type] = now + timedelta(seconds=-1 * conf.log_initial)
-        npt[log_type] = None
+        dtime[lt] = now + timedelta(seconds=-1 * conf.log_initial)
+        npt[lt] = None
 
         # Adjust to avoid the overlap with a previous run, warn on a possible gap
         # The gap is caused by either: app down time or the log source being disabled in earlier app run
         # was greater than 30 days (default of 'log_initial')
         try:
-            if lastLogFile.get(logtype=log_type):
+            if lastLogFile.get(logtype=lt):
                 try:
                     # Could be missing due to the old file format
-                    npt[log_type] = lastLogFile.get('nextpagetoken', log_type)
-                    if npt[log_type] == '':
-                        npt[log_type] = None
-                except Exception as ex:
-                    npt[log_type] = None
+                    npt[lt] = lastLogFile.get('nextpagetoken', lt)
+                    if npt[lt] == '':
+                        npt[lt] = None
+                except Exception:
+                    npt[lt] = None
 
-                d = strptime(lastLogFile.get('time', log_type))
-                if dtime[log_type] <= d:
-                    dtime[log_type] = d
+                d = strptime(lastLogFile.get('time', lt))
+                if dtime[lt] <= d:
+                    dtime[lt] = d
                 else:
                     # Important! For a possible gap, discard nextpagetoken loaded from lastlog
                     # NOTE: This still has an extremely remote possibility of data duplication
                     #       (no messages over the gap period is a necessary condition then - unpopulated gap)
-                    npt[log_type] = None
-                    logger.warning('Possible gap for log type %s from %s to %s' %
-                                   (str(log_type),
-                                    d.strftime(TIME_FORMAT_LOG),
-                                    dtime[log_type].strftime(TIME_FORMAT_LOG))
-                                   )
+                    npt[lt] = None
+                    app.logger.warning('Possible gap for log type %s from %s to %s' %
+                                       (str(lt),
+                                           d.strftime(TIME_FORMAT_LOG),
+                                           dtime[lt].strftime(TIME_FORMAT_LOG))
+                                       )
         except Exception as ex:
             # Bad data in lastLogFile? Treat overlap as data corruption so exclude its possibility and warn
             # Discard nextpagetoken loaded from lastlog, also see the comment just above
-            npt[log_type] = None
-            dtime[log_type] = now
-            logger.warning('Possible gap for log type %s to %s due to bad last log data: %s' %
-                           (str(log_type),
-                            dtime[log_type].strftime(TIME_FORMAT_LOG),
-                               ex)
-                           )
+            npt[lt] = None
+
+            # By just setting it to 'now' the bad data would persist without getting any new messages and
+            # hence no chance to reset the data to good format unless due to a fluke of a very recent message.
+            # Instead, do a soft reset
+            dtime[lt] = now
+            app.logger.error('Probable gap for log type %s to %s due to BAD LAST LOG DATA: %s' %
+                             (str(lt),
+                                 dtime[lt].strftime(TIME_FORMAT_LOG),
+                                 ex)
+                             )
+
+            # Re-write the file back to the good format
+            # TODO If wishing to reduce missing a lot of data in favor of some overlap,
+            #      may rely on the last log file mofification time minus polling period (which one? could have changed)
+            app.logger.warning('Auto-reset initiated due to bad last log data. The data will resume when new messages get available.')
+            lastLogFile.updateError(conf, 'Auto-reset initiated due to bad last log data. Waiting for the new data becoming available starting from (see the \'time\' field below)', now, lt)
+
+            # Should never end up here again unless the file gets invalidated outside the app once more
 
     # Assume syslog daemon
     # TODO Add a mechanism to stop to switch back to API poll mode, restart is
@@ -779,16 +757,17 @@ def PollLogs(ctx, conf, log_types=None, condition=Condition()):
         with conf._lock(condition, notify=False):
             isDaemon = True
             while isDaemon:
-                transferLogs(ctx, conf, condition, dtime, log_types, None, npt)
+                transferLogs(ctx, conf, condition, dtime, logTypes, None, npt)
 
                 # Run only once if not in the daemon mode
                 isDaemon = conf._isDaemon
 
         res = conf.status
 
-    logger.info('Polling: stop polling log events.. pid=%s, tid=%s' % (pid, tid))
-    logger.info('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
+    app.logger.info('Polling: stop polling log events.. pid=%s, tid=%s' % (pid, tid))
+    app.logger.info('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
     return res
+
 
 class bitglassapi:
 
@@ -831,7 +810,7 @@ class bitglassapi:
 
 def startWorkerThread(conf, isDaemon=True, bgapi=None):
 
-    Initialize(bgapi, _logger=logger, _conf=conf)
+    Initialize(bgapi, _logger=app.logger, _conf=conf)
 
     condition = Condition()
     thread = Thread(target=PollLogs, args=(bgapi, conf, None, condition))
@@ -845,13 +824,11 @@ def startWorkerThread(conf, isDaemon=True, bgapi=None):
 
 if __name__ == '__main__':
 
-    from app import cli
-
     Initialize(None)
 
     # Only for debugging full context cli variants so that can use one debug setting for all
     if conf._isEnabled('debug'):
-        cli.main(logger, conf, bitglassapi)
+        main(app.logger, conf, bitglassapi)
 
     # Start the worker thread explicitly if main() above didn't exit()
     startWorkerThread(conf, False, bitglassapi())

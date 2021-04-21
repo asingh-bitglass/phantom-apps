@@ -46,5 +46,7 @@ def UpdateLoggingPath(defaultlogfolder=None):
         else:
             loggingpath = os.path.join(datapath, 'app.log')
 
+    return loggingpath
+
 
 loggingpath = UpdateLoggingPath()

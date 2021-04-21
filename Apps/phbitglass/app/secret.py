@@ -46,7 +46,7 @@ class Password(object):
         try:
             from qpylib.encdec import Encryption
             self.pswd = Encryption({'name': self.name, 'user': self.simpleHash(self.user)}).decrypt()
-        except Exception as ex:
+        except ImportError:
             pass
 
     def save(self):
@@ -55,5 +55,5 @@ class Password(object):
         try:
             from qpylib.encdec import Encryption
             Encryption({'name': self.name, 'user': self.simpleHash(self.user)}).encrypt(self.pswd)
-        except Exception as ex:
+        except ImportError:
             pass
