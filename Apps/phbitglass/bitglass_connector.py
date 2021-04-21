@@ -108,7 +108,7 @@ class BitglassConnector(BaseConnector):
             else:
                 error_code = ERR_CODE_MSG
                 error_msg = ERR_MSG_UNAVAILABLE
-        except:
+        except Exception:
             error_code = ERR_CODE_MSG
             error_msg = ERR_MSG_UNAVAILABLE
 
@@ -118,7 +118,7 @@ class BitglassConnector(BaseConnector):
             else:
                 error_text = "Error Code: {0}. Error Message: {1}".format(
                     error_code, error_msg)
-        except:
+        except Exception:
             self.debug_print("Error occurred while parsing the error message")
             error_text = PARSE_ERR_MSG
 
@@ -489,8 +489,8 @@ class BitglassConnector(BaseConnector):
                 params = json.loads(''.join([
                     '{',
                     '"groupname": "{0}", "companyemail": [{1}]'.format(groupName,
-                                                                    ','.join(['"' + u + '"'
-                                                                            for u in self.newUsers])),
+                                                                       ','.join(['"' + u + '"'
+                                                                                for u in self.newUsers])),
                     '}',
                 ]))
         except Exception:
@@ -515,7 +515,7 @@ class BitglassConnector(BaseConnector):
                 params = json.loads(''.join([
                     '{',
                     '"groupname": "{0}", "companyemail": [{1}]'.format(groupName,
-                                                                    ','.join(['"' + u + '"'
+                                                                       ','.join(['"' + u + '"'
                                                                                 for u in [userName]])),
                     '}',
                 ]))
