@@ -41,9 +41,6 @@ from app.configForward import ConfigForward, log_types
 from app.logevent import pushLog
 
 
-from app.cli import main
-
-
 conf = None
 lastLogFile = None
 
@@ -827,6 +824,8 @@ def startWorkerThread(conf, isDaemon=True, bgapi=None):
 
 
 if __name__ == '__main__':
+
+    from app.cli import main
 
     Initialize(None)
 
