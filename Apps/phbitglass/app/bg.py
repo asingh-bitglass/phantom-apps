@@ -13,25 +13,22 @@ import json
 from six import PY2
 from six.moves import socketserver
 
-
-if PY2:
-    import urllib2 as urllib
-    from urllib2 import HTTPError
-else:
-    from urllib.error import HTTPError
-    import urllib.request as urllib
-    # TODO ?? For some weird reason, the requests session is closed on first reference
-    # if imported here globally (to move the failure earlier)
-    # import requests_oauth2
-
-
 import base64
-
 import time
 import copy
 from threading import Thread, Condition
 from datetime import datetime, timedelta
 # from threading import get_ident
+
+# The legacy early PY2 stuff, not using
+if PY2:
+    # import urllib2 as urllib
+    from urllib2 import HTTPError
+else:
+    from urllib.error import HTTPError
+    # import urllib.request as urllib
+import requests
+from requests.auth import HTTPBasicAuth, AuthBase
 
 
 import app
@@ -43,6 +40,18 @@ from app.logevent import pushLog
 
 conf = None
 lastLogFile = None
+
+
+# For now, just using the token, never need to get/refresh one automatically (by using requests_oauthlib)
+class OAuth2Token(AuthBase):
+    def __init__(self, access_token):
+        self.access_token = access_token
+
+    def __call__(self, request):
+        request.headers['Authorization'] = 'Bearer {0}'.format(
+            self.access_token
+        )
+        return request
 
 
 def ingestLogEvent(ctx, d, address, logTime):
@@ -377,7 +386,6 @@ def restCall(_,
              url, endpoint, dataParams,
              auth_token,
              proxies=None,
-             method=None,
              verify=True,
              username=None,
              password=None):
@@ -402,66 +410,31 @@ def restCall(_,
     else:
         auth_type = 'Bearer'
 
-    try:
-        # This check is done earlier for PY3 to fail before run time
-        # if PY2:
-        import requests_oauth2
-        haveOAuth2 = True
-    except ImportError as ex:
-        app.logger.warning('{0}\n - Defaulting to the legacy urllib module'.format(str(ex)))
-        haveOAuth2 = False
-
     # Use requests by default if available
-    # Note: requests-oauth2 is not installed on QRadar by default
     r = None
-    if (method is None or method == 'requests') and haveOAuth2:
-        import requests
-        from requests.auth import HTTPBasicAuth
 
-        # The authentication header is added below
-        headers = {'Content-Type': 'application/json'}
+    # The authentication header is added below
+    headers = {'Content-Type': 'application/json'}
 
-        d = {}
-        with requests.Session() as s:
-            if auth_type == 'Basic':
-                s.auth = HTTPBasicAuth(username, password)
-            else:
-                s.auth = requests_oauth2.OAuth2BearerToken(auth_token)
+    d = {}
+    with requests.Session() as s:
+        if auth_type == 'Basic':
+            s.auth = HTTPBasicAuth(username, password)
+        else:
+            s.auth = OAuth2Token(auth_token)
 
-            if proxies is not None and len(proxies) > 0:
-                s.proxies = proxies
-
-            if isinstance(dataParams, dict):
-                # Assume json
-                r = s.post(url + endpoint, headers=headers, verify=verify, json=dataParams)
-            else:
-                # TODO Inject failures (including the initial failure) for testing: raise Exception('test')
-                r = s.get(url + endpoint + dataParams, headers=headers, verify=verify)
-
-            r.raise_for_status()
-            d = r.json()
-    else:
-        headers = {'Content-Type': 'application/json', 'Authorization': auth_type + ' ' + auth_token}
+        if proxies is not None and len(proxies) > 0:
+            s.proxies = proxies
 
         if isinstance(dataParams, dict):
             # Assume json
-            req = urllib.Request(url + endpoint, json.dumps(dataParams), headers, unverifiable=not verify)
-            if PY2:
-                req = urllib.Request(url + endpoint, json.dumps(dataParams), headers, unverifiable=not verify)
-            else:
-                req = urllib.Request(url + endpoint, json.dumps(dataParams).encode('utf-8'), headers, unverifiable=not verify)
+            r = s.post(url + endpoint, headers=headers, verify=verify, json=dataParams)
         else:
-            req = urllib.Request(url + endpoint + dataParams, None, headers, unverifiable=not verify)
+            # TODO Inject failures (including the initial failure) for testing: raise Exception('test')
+            r = s.get(url + endpoint + dataParams, headers=headers, verify=verify)
 
-        if proxies is not None and len(proxies) > 0:
-            # TODO ?? Do it once at init time unless this option ends up exposed in the UI
-            opener = urllib.build_opener(urllib.ProxyHandler(proxies))
-            urllib.install_opener(opener)
-
-        # TODO Security scan medium. Remove urllib fallback use when QRadar moves to Python 3
-        resp = urllib.urlopen(req)  # nosec: <explanation>The url is validated to be https</explanation>
-        respTxt = resp.read()
-        d = json.loads(respTxt)
+        r.raise_for_status()
+        d = r.json()
 
     return d, r
 
@@ -474,7 +447,6 @@ def RestCall(_, endpoint, dataParams):
         dataParams,
         conf._auth_token.pswd,
         conf.proxies,
-        conf.method,
         conf.verify,
         conf._username,
         conf._password.pswd
@@ -536,7 +508,6 @@ def drainLogEvents(ctx, dtime, conf, logType, logData=None, nextPageToken=None):
                                       url, endpoint, dataParams,
                                       conf._auth_token.pswd,
                                       conf.proxies,
-                                      conf.method,
                                       conf.verify,
                                       conf._username,
                                       conf._password.pswd)

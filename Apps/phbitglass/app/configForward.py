@@ -96,7 +96,6 @@ class ConfigForward(Config):
         log_initial=('-i',
                      'log initial period, seconds'),
         # - TODO proxies, reset_time
-        # - ?? method
     )
     )
 
@@ -138,7 +137,6 @@ class ConfigForward(Config):
         self.reset_fence = ''   # Used only by x_*.py modules' code where an alternative config store is used without the read-once-reset-to-default functionality like Splunk
 
         # Additional (optional) settings, not exposed in the UI for now
-        self.method = None
         self.verify = True
         self.customer = 'Bitglass'
         self.useNextPageToken = True
